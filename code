@@ -1,0 +1,1173 @@
+import "dotenv/config";
+import express from "express";
+import http from "http";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import { WebSocketServer, WebSocket } from "ws";
+import {
+  GoogleGenAI,
+  Modality,
+  Type,
+  type FunctionDeclaration,
+  type LiveServerMessage,
+} from "@google/genai";
+
+// ============================================================================
+// Domain Types & Role Configurations
+// ============================================================================
+
+type InterviewStage =
+  | "opening"
+  | "technical_core"
+  | "adaptive_deep_dive"
+  | "behavioral_scenario"
+  | "wrap_up";
+
+type SessionStatus = "in_progress" | "paused" | "completed";
+type VoicePersona = "Kore" | "Zephyr" | "Puck" | "Charon" | "Fenrir";
+
+interface RoleTemplate {
+  id: string;
+  title: string;
+  department: string;
+  seniority: "Mid-Level" | "Senior" | "Staff";
+  summary: string;
+  competencies: string[];
+  seedQuestions: string[];
+}
+
+interface TranscriptEntry {
+  id: string;
+  speaker: "interviewer" | "candidate";
+  text: string;
+  timestamp: string;
+  stage: InterviewStage;
+  interrupted?: boolean;
+}
+
+interface CompetencyScore {
+  competency: string;
+  score: number;
+  rationale: string;
+  evidenceQuote: string;
+}
+
+interface QuestionReview {
+  topic: string;
+  candidateSummary: string;
+  depthRating: "Strong" | "Adequate" | "Shallow";
+  followUpEffectiveness: string;
+}
+
+interface CandidateEvaluation {
+  generatedAt: string;
+  overallScore: number;
+  recommendation: "Strong Hire" | "Hire" | "Lean Hire" | "No Hire";
+  executiveSummary: string;
+  competencyScores: CompetencyScore[];
+  strengths: string[];
+  concerns: string[];
+  questionBreakdown: QuestionReview[];
+  nextRoundFocus: string[];
+}
+
+interface InterviewSession {
+  id: string;
+  candidateName: string;
+  roleId: string;
+  roleTitle: string;
+  seniority: string;
+  voiceName: VoicePersona;
+  status: SessionStatus;
+  currentStage: InterviewStage;
+  adaptationNotes: string[];
+  interruptionCount: number;
+  resumeCount: number;
+  elapsedSeconds: number;
+  createdAt: string;
+  updatedAt: string;
+  transcript: TranscriptEntry[];
+  evaluation: CandidateEvaluation | null;
+}
+
+interface StoreFile {
+  roles: RoleTemplate[];
+  sessions: InterviewSession[];
+}
+
+const VALID_STAGES: InterviewStage[] = [
+  "opening",
+  "technical_core",
+  "adaptive_deep_dive",
+  "behavioral_scenario",
+  "wrap_up",
+];
+
+const DEFAULT_ROLES: RoleTemplate[] = [
+  {
+    id: "role-backend",
+    title: "Senior Backend Engineer",
+    department: "Platform Engineering",
+    seniority: "Senior",
+    summary:
+      "Evaluates distributed systems design, API reliability, data modeling, and incident ownership.",
+    competencies: [
+      "Distributed Systems & Scalability",
+      "Data Modeling & Storage",
+      "API Design & Reliability",
+      "Debugging & Production Ownership",
+      "Technical Communication",
+    ],
+    seedQuestions: [
+      "Walk through a backend service you scaled under heavy traffic and the hardest bottleneck you hit.",
+      "How do you handle idempotency, retries, and partial failures across asynchronous services?",
+      "Describe a production outage you helped resolve and what permanent safeguards followed.",
+    ],
+  },
+  {
+    id: "role-frontend",
+    title: "Frontend Systems Engineer",
+    department: "Product Engineering",
+    seniority: "Senior",
+    summary:
+      "Covers component architecture, rendering performance, accessibility, and resilient client state.",
+    competencies: [
+      "Component & State Architecture",
+      "Browser Rendering & Performance",
+      "Accessibility & Semantic Markup",
+      "API Integration & Caching",
+      "Cross-Functional Collaboration",
+    ],
+    seedQuestions: [
+      "Tell me about a client-side rendering or state management bottleneck you diagnosed and resolved.",
+      "How do you structure shared component libraries without compromising accessibility?",
+      "Walk through how you design optimistic UI updates and error recovery under flaky networks.",
+    ],
+  },
+  {
+    id: "role-voice-systems",
+    title: "Voice Systems Engineer",
+    department: "Conversational Infrastructure",
+    seniority: "Senior",
+    summary:
+      "Assesses streaming audio pipelines, endpointing, voice activity detection, barge-in handling, and latency budgets.",
+    competencies: [
+      "Real-Time Audio & Streaming Architecture",
+      "Turn-Taking, VAD & Barge-In Handling",
+      "Speech Recognition & Synthesis Quality",
+      "Evaluation & Conversation Reliability",
+      "Systems Trade-Off Reasoning",
+    ],
+    seedQuestions: [
+      "How do you budget and measure mouth-to-ear latency across ASR, inference, and TTS stages?",
+      "What strategies prevent false barge-in triggers in noisy acoustic environments?",
+      "How do you evaluate voice agents systematically before releasing prompt or model changes?",
+    ],
+  },
+  {
+    id: "role-ml",
+    title: "Machine Learning Engineer",
+    department: "Applied ML",
+    seniority: "Senior",
+    summary:
+      "Focuses on dataset curation, offline vs. online evaluation, inference optimization, and failure analysis.",
+    competencies: [
+      "Modeling & Feature Engineering",
+      "Evaluation Design & Metrics",
+      "Training & Serving Infrastructure",
+      "Data Quality & Drift Mitigation",
+      "Product Impact Alignment",
+    ],
+    seedQuestions: [
+      "Describe a model you shipped where offline validation diverged from live user outcomes.",
+      "How do you reduce serving latency without degrading critical accuracy slices?",
+      "How do you detect and fix data leakage or distribution shift in production pipelines?",
+    ],
+  },
+  {
+    id: "role-pm",
+    title: "Product Manager",
+    department: "Product Strategy",
+    seniority: "Senior",
+    summary:
+      "Examines customer discovery, roadmap prioritization, experimentation metrics, and cross-team delivery.",
+    competencies: [
+      "Problem Discovery & User Insight",
+      "Prioritization & Trade-Off Rigor",
+      "Metric Design & Experimentation",
+      "Execution & Stakeholder Alignment",
+      "Structured Communication",
+    ],
+    seedQuestions: [
+      "Tell me about a roadmap trade-off where you had to push back on a major stakeholder request.",
+      "How do you define north-star and guardrail metrics for an ambiguous zero-to-one product?",
+      "Walk through a launch that missed targets and how you diagnosed the root cause.",
+    ],
+  },
+];
+
+// ============================================================================
+// Persistent JSON Transcript & Session Store
+// ============================================================================
+
+const STORE_FILE = path.resolve(process.cwd(), "interviews_store.json");
+
+function loadStore(): StoreFile {
+  if (!fs.existsSync(STORE_FILE)) {
+    const initial: StoreFile = { roles: DEFAULT_ROLES, sessions: [] };
+    fs.writeFileSync(STORE_FILE, JSON.stringify(initial, null, 2), "utf-8");
+    return initial;
+  }
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(STORE_FILE, "utf-8")
+    ) as Partial<StoreFile>;
+    return {
+      roles:
+        Array.isArray(parsed.roles) && parsed.roles.length > 0
+          ? parsed.roles
+          : DEFAULT_ROLES,
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+    };
+  } catch {
+    return { roles: DEFAULT_ROLES, sessions: [] };
+  }
+}
+
+function saveStore(store: StoreFile): void {
+  fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), "utf-8");
+}
+
+// ============================================================================
+// Model Client, Interview Prompts & Structured Evaluator
+// ============================================================================
+
+function getClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("Missing GEMINI_API_KEY environment variable.");
+  }
+  return new GoogleGenAI({ apiKey });
+}
+
+const INTERVIEW_TOOLS: FunctionDeclaration[] = [
+  {
+    name: "advance_stage",
+    description:
+      "Update the current interview stage and record how questioning adapted to the candidate's answer.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        stage: {
+          type: Type.STRING,
+          description:
+            "One of: opening, technical_core, adaptive_deep_dive, behavioral_scenario, wrap_up",
+        },
+        adaptationNote: {
+          type: Type.STRING,
+          description:
+            "Short summary of the follow-up pivot taken based on the candidate's response.",
+        },
+      },
+      required: ["stage", "adaptationNote"],
+    },
+  },
+  {
+    name: "conclude_interview",
+    description:
+      "Signal that the wrap-up stage is complete and the candidate has finished asking questions.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        closingNote: {
+          type: Type.STRING,
+          description: "Brief closing confirmation.",
+        },
+      },
+      required: ["closingNote"],
+    },
+  },
+];
+
+function buildSystemPrompt(
+  session: InterviewSession,
+  role: RoleTemplate,
+  isResume: boolean
+): string {
+  const priorTranscript = session.transcript
+    .map(
+      (entry) =>
+        `[${entry.stage}] ${
+          entry.speaker === "interviewer" ? "Interviewer" : session.candidateName
+        }${entry.interrupted ? " (interrupted)" : ""}: ${entry.text}`
+    )
+    .join("\n");
+
+  return [
+    `You are conducting a structured voice screening interview for ${role.title} (${session.seniority}, ${role.department}).`,
+    `Candidate: ${session.candidateName}.`,
+    `Role focus: ${role.summary}`,
+    `Competencies to evaluate: ${role.competencies.join(", ")}.`,
+    `Seed question themes (adapt freely based on candidate responses):`,
+    ...role.seedQuestions.map((q, i) => `${i + 1}. ${q}`),
+    "",
+    "Five-stage interview progression:",
+    "1. opening: Brief professional greeting, confirm readiness, short intro.",
+    "2. technical_core: Core domain questions tailored to the target role.",
+    "3. adaptive_deep_dive: Contextual follow-ups probing architecture, trade-offs, metrics, and edge cases from the candidate's answers.",
+    "4. behavioral_scenario: Ownership, collaboration, and incident or ambiguity handling.",
+    "5. wrap_up: Invite candidate questions, thank them, and close professionally.",
+    "",
+    "Conversation rules:",
+    "- Ask one focused question at a time in 2 to 4 concise spoken sentences.",
+    "- If interrupted mid-sentence, yield immediately and respond directly to the candidate's point.",
+    "- Call advance_stage when transitioning stages or adapting difficulty based on candidate depth.",
+    "- Call conclude_interview once closing remarks are finished.",
+    "",
+    isResume
+      ? `RESUME STATE: Interview paused during "${session.currentStage}". Welcome the candidate back briefly and resume smoothly without repeating covered topics.\n\nPrior transcript:\n${priorTranscript}`
+      : `Starting stage: ${session.currentStage}. Greet the candidate and ask your opening question.`,
+  ].join("\n");
+}
+
+async function evaluateTranscript(
+  session: InterviewSession,
+  role: RoleTemplate
+): Promise<CandidateEvaluation> {
+  const candidateTurns = session.transcript.filter(
+    (t) => t.speaker === "candidate" && t.text.trim().length > 0
+  );
+  if (candidateTurns.length === 0) {
+    throw new Error("No candidate responses recorded to evaluate.");
+  }
+
+  const ai = getClient();
+  const formatted = session.transcript
+    .map(
+      (t, idx) =>
+        `${idx + 1}. [${t.timestamp}] [${t.stage}] ${
+          t.speaker === "interviewer" ? "Interviewer" : session.candidateName
+        }${t.interrupted ? " (interrupted)" : ""}: ${t.text}`
+    )
+    .join("\n");
+
+  const response = await ai.models.generateContent({
+    model: "gemini-4-hydrogen",
+    contents: [
+      `Role: ${role.title} (${session.seniority})`,
+      `Candidate: ${session.candidateName}`,
+      `Competencies: ${role.competencies.join(", ")}`,
+      `Duration: ${session.elapsedSeconds}s | Interruptions: ${session.interruptionCount} | Resumes: ${session.resumeCount}`,
+      "",
+      "Produce an objective, evidence-backed candidate evaluation grounded strictly in the transcript below.",
+      "",
+      formatted,
+    ].join("\n"),
+    config: {
+      systemInstruction:
+        "You are a senior hiring panelist writing structured screening evaluations. Cite direct transcript evidence for each score.",
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          overallScore: { type: Type.INTEGER },
+          recommendation: { type: Type.STRING },
+          executiveSummary: { type: Type.STRING },
+          competencyScores: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                competency: { type: Type.STRING },
+                score: { type: Type.INTEGER },
+                rationale: { type: Type.STRING },
+                evidenceQuote: { type: Type.STRING },
+              },
+              required: ["competency", "score", "rationale", "evidenceQuote"],
+            },
+          },
+          strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+          concerns: { type: Type.ARRAY, items: { type: Type.STRING } },
+          questionBreakdown: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                topic: { type: Type.STRING },
+                candidateSummary: { type: Type.STRING },
+                depthRating: { type: Type.STRING },
+                followUpEffectiveness: { type: Type.STRING },
+              },
+              required: [
+                "topic",
+                "candidateSummary",
+                "depthRating",
+                "followUpEffectiveness",
+              ],
+            },
+          },
+          nextRoundFocus: { type: Type.ARRAY, items: { type: Type.STRING } },
+        },
+        required: [
+          "overallScore",
+          "recommendation",
+          "executiveSummary",
+          "competencyScores",
+          "strengths",
+          "concerns",
+          "questionBreakdown",
+          "nextRoundFocus",
+        ],
+      },
+    },
+  });
+
+  const text = (response.text ?? "").trim();
+  if (!text) {
+    throw new Error("Empty evaluation response.");
+  }
+
+  const parsed = JSON.parse(text) as Omit<CandidateEvaluation, "generatedAt">;
+  return {
+    ...parsed,
+    overallScore: Math.max(0, Math.min(100, Math.round(parsed.overallScore))),
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+// ============================================================================
+// Embedded Single-Page Web Client (Served on GET /)
+// ============================================================================
+
+const CLIENT_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VoxScreen — Voice Interview Agent</title>
+  <style>
+    :root { --bg:#f8fafc; --surface:#ffffff; --ink:#0f172a; --muted:#475569; --line:#e2e8f0; --accent:#1d4ed8; --ok:#15803d; --warn:#b45309; --err:#b91c1c; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--ink); }
+    header { height:60px; background:var(--surface); border-bottom:1px solid var(--line); padding:0 24px; display:flex; align-items:center; justify-content:space-between; }
+    main { max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:20px; }
+    .grid { display:grid; grid-template-columns:1.15fr 0.85fr; gap:20px; }
+    @media (max-width: 900px) { .grid { grid-template-columns:1fr; } }
+    .panel { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:20px; }
+    h1, h2, h3 { margin:0 0 8px; }
+    label { display:block; font-size:12px; font-weight:600; color:var(--muted); margin:12px 0 6px; }
+    input, select { width:100%; padding:9px 12px; border:1px solid #cbd5e1; border-radius:8px; font-size:14px; }
+    button { padding:9px 14px; border-radius:8px; border:1px solid #cbd5e1; background:#fff; color:var(--ink); font-size:13px; font-weight:600; cursor:pointer; }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button.danger { border-color:#fecaca; color:var(--err); }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .transcript { height:380px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; padding-right:6px; }
+    .turn { border-bottom:1px solid #f1f5f9; padding-bottom:10px; }
+    .meta { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:4px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-variant-numeric: tabular-nums; }
+    canvas { width:100%; height:110px; display:block; }
+    pre { white-space:pre-wrap; background:#f8fafc; border:1px solid var(--line); padding:14px; border-radius:8px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>VoxScreen</strong>
+    <span id="statusText" class="mono" style="font-size:12px;color:#475569">Idle</span>
+  </header>
+  <main>
+    <div id="setupPanel" class="panel">
+      <h2>Start Voice Screening Interview</h2>
+      <div class="grid">
+        <div>
+          <label for="candidateName">Candidate Name</label>
+          <input id="candidateName" placeholder="Jordan Patel" />
+          <label for="roleSelect">Job Role</label>
+          <select id="roleSelect"></select>
+        </div>
+        <div>
+          <label for="senioritySelect">Seniority</label>
+          <select id="senioritySelect">
+            <option value="Mid-Level">Mid-Level</option>
+            <option value="Senior" selected>Senior</option>
+            <option value="Staff">Staff</option>
+          </select>
+          <label for="voiceSelect">Voice</label>
+          <select id="voiceSelect">
+            <option value="Kore">Kore</option>
+            <option value="Zephyr">Zephyr</option>
+            <option value="Charon">Charon</option>
+            <option value="Puck">Puck</option>
+            <option value="Fenrir">Fenrir</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:16px">
+        <button id="startBtn" class="primary">Start Voice Interview</button>
+      </div>
+    </div>
+
+    <div id="livePanel" class="grid" style="display:none">
+      <div class="panel">
+        <div class="row" style="justify-content:space-between;margin-bottom:12px">
+          <div>
+            <h2 id="liveHeader" style="margin:0"></h2>
+            <div id="stageLabel" style="font-size:12px;color:#1d4ed8;font-weight:600">Stage: opening</div>
+          </div>
+          <div id="timerLabel" class="mono" style="font-size:13px">00:00</div>
+        </div>
+        <canvas id="waveform"></canvas>
+        <div class="row" style="margin:14px 0">
+          <button id="muteBtn">Mute Mic</button>
+          <button id="interruptBtn">Interrupt</button>
+          <button id="pauseBtn">Pause</button>
+          <button id="resumeBtn" class="primary" style="display:none">Resume</button>
+          <button id="finishBtn" class="danger">Finish & Evaluate</button>
+        </div>
+        <div class="row">
+          <input id="textFallback" placeholder="Optional keyboard response..." style="flex:1" />
+          <button id="sendTextBtn">Send</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Live Transcript</h3>
+        <div id="transcriptBox" class="transcript"></div>
+      </div>
+    </div>
+
+    <div id="reportPanel" class="panel" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <h2 style="margin:0">Structured Candidate Evaluation</h2>
+        <button id="downloadReportBtn">Download JSON</button>
+      </div>
+      <pre id="reportOutput"></pre>
+    </div>
+
+    <div class="panel">
+      <h3>Saved Interview Sessions</h3>
+      <div id="sessionsList" style="font-size:13px;color:#475569">Loading...</div>
+    </div>
+  </main>
+
+  <script>
+    let currentSession = null;
+    let ws = null;
+    let inputCtx = null;
+    let outputCtx = null;
+    let mediaStream = null;
+    let processor = null;
+    let outputAnalyser = null;
+    let inputAnalyser = null;
+    let nextStartTime = 0;
+    let activeSources = new Set();
+    let isMuted = false;
+    let elapsedSeconds = 0;
+    let timerId = null;
+
+    const el = (id) => document.getElementById(id);
+
+    function resampleTo16kPcmBase64(input, rate) {
+      const target = 16000;
+      const ratio = rate / target;
+      const outLen = Math.max(1, Math.floor(input.length / ratio));
+      const pcm = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const idx = Math.floor(i * ratio);
+        const s = Math.max(-1, Math.min(1, input[idx] || 0));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      const bytes = new Uint8Array(pcm.buffer);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return btoa(bin);
+    }
+
+    function stopPlayback() {
+      for (const src of activeSources) { try { src.stop(); } catch {} }
+      activeSources.clear();
+      nextStartTime = outputCtx ? outputCtx.currentTime : 0;
+    }
+
+    function playPcm24k(b64) {
+      if (!outputCtx || !outputAnalyser) return;
+      if (outputCtx.state === "suspended") outputCtx.resume();
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const view = new DataView(bytes.buffer);
+      const floats = new Float32Array(Math.floor(bytes.byteLength / 2));
+      for (let i = 0; i < floats.length; i++) floats[i] = view.getInt16(i * 2, true) / 32768;
+      const buf = outputCtx.createBuffer(1, floats.length, 24000);
+      buf.copyToChannel(floats, 0);
+      const src = outputCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(outputAnalyser);
+      const startAt = Math.max(outputCtx.currentTime, nextStartTime);
+      src.start(startAt);
+      nextStartTime = startAt + buf.duration;
+      activeSources.add(src);
+      src.onended = () => activeSources.delete(src);
+    }
+
+    function teardown() {
+      stopPlayback();
+      clearInterval(timerId);
+      if (processor) { processor.disconnect(); processor = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+      if (inputCtx) { inputCtx.close(); inputCtx = null; }
+      if (outputCtx) { outputCtx.close(); outputCtx = null; }
+      if (ws) { ws.close(); ws = null; }
+    }
+
+    function appendTurn(entry) {
+      const div = document.createElement("div");
+      div.className = "turn";
+      div.innerHTML = '<div class="meta"><strong>' +
+        (entry.speaker === "interviewer" ? "Interviewer" : currentSession.candidateName) +
+        (entry.interrupted ? " (interrupted)" : "") +
+        '</strong><span class="mono">' + new Date(entry.timestamp).toLocaleTimeString() + '</span></div>' +
+        '<div>' + entry.text.replace(/</g, "&lt;") + '</div>';
+      el("transcriptBox").appendChild(div);
+      el("transcriptBox").scrollTop = el("transcriptBox").scrollHeight;
+    }
+
+    async function connectLive(session, isResume) {
+      teardown();
+      currentSession = session;
+      elapsedSeconds = session.elapsedSeconds || 0;
+      el("livePanel").style.display = "grid";
+      el("liveHeader").textContent = session.candidateName + " — " + session.roleTitle;
+      el("stageLabel").textContent = "Stage: " + session.currentStage;
+      el("transcriptBox").innerHTML = "";
+      (session.transcript || []).forEach(appendTurn);
+      el("statusText").textContent = "Connecting...";
+
+      outputCtx = new AudioContext({ sampleRate: 24000 });
+      outputAnalyser = outputCtx.createAnalyser();
+      outputAnalyser.connect(outputCtx.destination);
+      nextStartTime = outputCtx.currentTime;
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        inputCtx = new AudioContext({ sampleRate: 16000 });
+        const src = inputCtx.createMediaStreamSource(mediaStream);
+        inputAnalyser = inputCtx.createAnalyser();
+        processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        src.connect(inputAnalyser);
+        inputAnalyser.connect(processor);
+        processor.connect(inputCtx.destination);
+      } catch {
+        el("statusText").textContent = "Mic unavailable (keyboard mode)";
+      }
+
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(proto + "//" + location.host + "/ws/interview");
+      ws.onopen = () => ws.send(JSON.stringify({ type: "start", sessionId: session.id, resume: isResume }));
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "ready") {
+          el("statusText").textContent = "Live";
+          el("pauseBtn").style.display = "";
+          el("resumeBtn").style.display = "none";
+          timerId = setInterval(() => {
+            elapsedSeconds++;
+            const m = String(Math.floor(elapsedSeconds / 60)).padStart(2, "0");
+            const s = String(elapsedSeconds % 60).padStart(2, "0");
+            el("timerLabel").textContent = m + ":" + s;
+          }, 1000);
+          if (processor && inputCtx) {
+            const sr = inputCtx.sampleRate;
+            processor.onaudioprocess = (ev) => {
+              if (isMuted || !ws || ws.readyState !== 1) return;
+              const b64 = resampleTo16kPcmBase64(ev.inputBuffer.getChannelData(0), sr);
+              ws.send(JSON.stringify({ type: "audio", audio: b64 }));
+            };
+          }
+        } else if (msg.type === "audio") {
+          playPcm24k(msg.audio);
+        } else if (msg.type === "transcript_committed") {
+          appendTurn(msg.entry);
+        } else if (msg.type === "interrupted") {
+          stopPlayback();
+          el("statusText").textContent = "Interrupted — Listening";
+        } else if (msg.type === "stage_updated") {
+          el("stageLabel").textContent = "Stage: " + msg.stage;
+        } else if (msg.type === "error") {
+          el("statusText").textContent = "Error: " + msg.message;
+        }
+      };
+    }
+
+    async function refreshData() {
+      const [rolesRes, sessRes] = await Promise.all([fetch("/api/roles"), fetch("/api/sessions")]);
+      const { roles } = await rolesRes.json();
+      const { sessions } = await sessRes.json();
+      el("roleSelect").innerHTML = roles.map((r) => '<option value="' + r.id + '">' + r.title + '</option>').join("");
+      if (!sessions.length) {
+        el("sessionsList").textContent = "No saved sessions yet.";
+        return;
+      }
+      el("sessionsList").innerHTML = sessions.map((s) =>
+        '<div class="row" style="justify-content:space-between;padding:8px 0;border-bottom:1px solid #f1f5f9">' +
+        '<div><strong>' + s.candidateName + '</strong> — ' + s.roleTitle + ' (' + s.status + ', ' + s.transcript.length + ' turns)</div>' +
+        '<div class="row">' +
+        (s.status === "paused" ? '<button onclick="resumeSaved(\\'' + s.id + '\\')">Resume</button>' : '') +
+        '<button onclick="viewSaved(\\'' + s.id + '\\')">View</button></div></div>'
+      ).join("");
+    }
+
+    window.resumeSaved = async (id) => {
+      const res = await fetch("/api/sessions/" + id);
+      const { session } = await res.json();
+      connectLive(session, true);
+    };
+
+    window.viewSaved = async (id) => {
+      const res = await fetch("/api/sessions/" + id);
+      const { session } = await res.json();
+      currentSession = session;
+      el("reportPanel").style.display = "block";
+      el("reportOutput").textContent = JSON.stringify(session, null, 2);
+    };
+
+    el("startBtn").onclick = async () => {
+      const name = el("candidateName").value.trim();
+      if (!name) return;
+      const res = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          candidateName: name,
+          roleId: el("roleSelect").value,
+          seniority: el("senioritySelect").value,
+          voiceName: el("voiceSelect").value
+        })
+      });
+      const { session } = await res.json();
+      await refreshData();
+      connectLive(session, false);
+    };
+
+    el("muteBtn").onclick = () => {
+      isMuted = !isMuted;
+      el("muteBtn").textContent = isMuted ? "Unmute Mic" : "Mute Mic";
+    };
+    el("interruptBtn").onclick = () => {
+      stopPlayback();
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "manual_interrupt" }));
+    };
+    el("pauseBtn").onclick = async () => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "pause", elapsedSeconds }));
+      teardown();
+      el("statusText").textContent = "Paused";
+      el("pauseBtn").style.display = "none";
+      el("resumeBtn").style.display = "";
+      await refreshData();
+    };
+    el("resumeBtn").onclick = () => currentSession && window.resumeSaved(currentSession.id);
+    el("sendTextBtn").onclick = () => {
+      const txt = el("textFallback").value.trim();
+      if (!txt || !ws || ws.readyState !== 1) return;
+      stopPlayback();
+      ws.send(JSON.stringify({ type: "text", text: txt }));
+      el("textFallback").value = "";
+    };
+    el("finishBtn").onclick = async () => {
+      if (!currentSession) return;
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "finish", elapsedSeconds }));
+      teardown();
+      el("statusText").textContent = "Evaluating...";
+      const res = await fetch("/api/sessions/" + currentSession.id + "/evaluate", { method: "POST" });
+      const data = await res.json();
+      el("reportPanel").style.display = "block";
+      el("reportOutput").textContent = JSON.stringify(data, null, 2);
+      el("statusText").textContent = res.ok ? "Completed" : "Evaluation error";
+      await refreshData();
+    };
+    el("downloadReportBtn").onclick = () => {
+      if (!currentSession) return;
+      const blob = new Blob([el("reportOutput").textContent], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = currentSession.id + "_report.json";
+      a.click();
+    };
+
+    (function drawLoop() {
+      const c = el("waveform");
+      const ctx = c.getContext("2d");
+      const bins = new Uint8Array(64);
+      function frame() {
+        if (c.width !== c.clientWidth) { c.width = c.clientWidth || 400; c.height = 110; }
+        ctx.clearRect(0, 0, c.width, c.height);
+        const activeAnalyser = activeSources.size > 0 ? outputAnalyser : inputAnalyser;
+        if (activeAnalyser) activeAnalyser.getByteFrequencyData(bins); else bins.fill(0);
+        const count = 40;
+        const w = (c.width - (count - 1) * 4) / count;
+        ctx.fillStyle = activeSources.size > 0 ? "#1d4ed8" : "#15803d";
+        for (let i = 0; i < count; i++) {
+          const h = Math.max(3, (bins[i + 1] / 255) * 90);
+          ctx.fillRect(i * (w + 4), (110 - h) / 2, w, h);
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    })();
+
+    refreshData();
+  </script>
+</body>
+</html>`;
+
+// ============================================================================
+// HTTP & Real-Time WebSocket Server
+// ============================================================================
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+app.use(express.json({ limit: "2mb" }));
+
+app.get("/", (_req, res) => {
+  res.type("html").send(CLIENT_HTML);
+});
+
+app.get("/api/roles", (_req, res) => {
+  res.json({ roles: loadStore().roles });
+});
+
+app.post("/api/roles", (req, res) => {
+  const { title, department, seniority, summary, competencies, seedQuestions } =
+    req.body ?? {};
+  if (
+    typeof title !== "string" ||
+    !title.trim() ||
+    !Array.isArray(competencies) ||
+    competencies.length < 2
+  ) {
+    res.status(400).json({ error: "Provide a role title and at least two competencies." });
+    return;
+  }
+  const store = loadStore();
+  const role: RoleTemplate = {
+    id: `role-${crypto.randomUUID().slice(0, 8)}`,
+    title: title.trim(),
+    department: typeof department === "string" && department.trim() ? department.trim() : "Engineering",
+    seniority: seniority === "Mid-Level" || seniority === "Senior" || seniority === "Staff" ? seniority : "Senior",
+    summary: typeof summary === "string" ? summary.trim() : "",
+    competencies: competencies.map((c: unknown) => String(c).trim()).filter(Boolean),
+    seedQuestions: Array.isArray(seedQuestions)
+      ? seedQuestions.map((q: unknown) => String(q).trim()).filter(Boolean)
+      : [],
+  };
+  store.roles.push(role);
+  saveStore(store);
+  res.status(201).json({ role });
+});
+
+app.get("/api/sessions", (_req, res) => {
+  const store = loadStore();
+  res.json({ sessions: store.sessions });
+});
+
+app.get("/api/sessions/:id", (req, res) => {
+  const session = loadStore().sessions.find((s) => s.id === req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "Session not found." });
+    return;
+  }
+  res.json({ session });
+});
+
+app.post("/api/sessions", (req, res) => {
+  const { candidateName, roleId, seniority, voiceName } = req.body ?? {};
+  if (typeof candidateName !== "string" || !candidateName.trim()) {
+    res.status(400).json({ error: "Candidate name is required." });
+    return;
+  }
+  const store = loadStore();
+  const role = store.roles.find((r) => r.id === roleId) ?? store.roles[0];
+  const now = new Date().toISOString();
+  const session: InterviewSession = {
+    id: `int-${crypto.randomUUID().slice(0, 8)}`,
+    candidateName: candidateName.trim(),
+    roleId: role.id,
+    roleTitle: role.title,
+    seniority: typeof seniority === "string" && seniority.trim() ? seniority.trim() : role.seniority,
+    voiceName: ["Kore", "Zephyr", "Puck", "Charon", "Fenrir"].includes(voiceName) ? voiceName : "Kore",
+    status: "in_progress",
+    currentStage: "opening",
+    adaptationNotes: [],
+    interruptionCount: 0,
+    resumeCount: 0,
+    elapsedSeconds: 0,
+    createdAt: now,
+    updatedAt: now,
+    transcript: [],
+    evaluation: null,
+  };
+  store.sessions.unshift(session);
+  saveStore(store);
+  res.status(201).json({ session });
+});
+
+app.post("/api/sessions/:id/evaluate", async (req, res) => {
+  const store = loadStore();
+  const session = store.sessions.find((s) => s.id === req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "Session not found." });
+    return;
+  }
+  const role = store.roles.find((r) => r.id === session.roleId) ?? store.roles[0];
+  try {
+    const evaluation = await evaluateTranscript(session, role);
+    session.evaluation = evaluation;
+    session.status = "completed";
+    session.updatedAt = new Date().toISOString();
+    saveStore(store);
+    res.json({ session, evaluation });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : "Evaluation failed.",
+    });
+  }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if ((req.url ?? "").split("?")[0] === "/ws/interview") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  }
+});
+
+wss.on("connection", (clientWs: WebSocket) => {
+  let activeSessionId: string | null = null;
+  let liveSession: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
+  let pendingCandidate = "";
+  let pendingInterviewer = "";
+
+  const sendJson = (payload: Record<string, unknown>) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify(payload));
+    }
+  };
+
+  const commitTurn = (
+    speaker: "interviewer" | "candidate",
+    text: string,
+    interrupted = false
+  ) => {
+    const clean = text.trim();
+    if (!clean || !activeSessionId) return;
+    const store = loadStore();
+    const session = store.sessions.find((s) => s.id === activeSessionId);
+    if (!session) return;
+    const entry: TranscriptEntry = {
+      id: `turn-${crypto.randomUUID().slice(0, 8)}`,
+      speaker,
+      text: clean,
+      timestamp: new Date().toISOString(),
+      stage: session.currentStage,
+      interrupted,
+    };
+    session.transcript.push(entry);
+    if (interrupted) session.interruptionCount += 1;
+    session.updatedAt = new Date().toISOString();
+    saveStore(store);
+    sendJson({ type: "transcript_committed", entry });
+  };
+
+  const flushPending = (interrupted = false) => {
+    if (pendingCandidate.trim()) {
+      commitTurn("candidate", pendingCandidate, false);
+      pendingCandidate = "";
+    }
+    if (pendingInterviewer.trim()) {
+      commitTurn("interviewer", pendingInterviewer, interrupted);
+      pendingInterviewer = "";
+    }
+  };
+
+  const closeLive = () => {
+    if (liveSession) {
+      try {
+        liveSession.close();
+      } catch {
+        // Ignore already closed
+      }
+      liveSession = null;
+    }
+  };
+
+  clientWs.on("message", async (raw) => {
+    let msg: {
+      type?: string;
+      sessionId?: string;
+      resume?: boolean;
+      audio?: string;
+      text?: string;
+      elapsedSeconds?: number;
+    };
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.type === "start" && msg.sessionId) {
+      const store = loadStore();
+      const session = store.sessions.find((s) => s.id === msg.sessionId);
+      if (!session) {
+        sendJson({ type: "error", message: "Session not found." });
+        return;
+      }
+      const role = store.roles.find((r) => r.id === session.roleId) ?? store.roles[0];
+      activeSessionId = session.id;
+      session.status = "in_progress";
+      if (msg.resume) session.resumeCount += 1;
+      saveStore(store);
+      closeLive();
+
+      try {
+        const ai = getClient();
+        const conn = await ai.live.connect({
+          model: "gemini-3.8-live",
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: session.voiceName } },
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction: buildSystemPrompt(session, role, Boolean(msg.resume)),
+            tools: [{ functionDeclarations: INTERVIEW_TOOLS }],
+          },
+          callbacks: {
+            onopen: () => sendJson({ type: "ready", stage: session.currentStage }),
+            onmessage: (message: LiveServerMessage) => {
+              const content = message.serverContent;
+              if (content?.inputTranscription?.text) {
+                if (pendingInterviewer.trim()) {
+                  commitTurn("interviewer", pendingInterviewer, false);
+                  pendingInterviewer = "";
+                }
+                pendingCandidate += content.inputTranscription.text;
+              }
+              if (content?.outputTranscription?.text) {
+                if (pendingCandidate.trim()) {
+                  commitTurn("candidate", pendingCandidate, false);
+                  pendingCandidate = "";
+                }
+                pendingInterviewer += content.outputTranscription.text;
+              }
+              for (const part of content?.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  sendJson({ type: "audio", audio: part.inlineData.data });
+                }
+              }
+              if (content?.interrupted) {
+                if (pendingInterviewer.trim()) {
+                  commitTurn("interviewer", pendingInterviewer, true);
+                  pendingInterviewer = "";
+                }
+                sendJson({ type: "interrupted" });
+              }
+              if (content?.turnComplete && pendingInterviewer.trim()) {
+                commitTurn("interviewer", pendingInterviewer, false);
+                pendingInterviewer = "";
+              }
+              if (message.toolCall?.functionCalls?.length && liveSession) {
+                const responses = message.toolCall.functionCalls.map((call) => {
+                  if (call.name === "advance_stage") {
+                    const args = (call.args ?? {}) as { stage?: string; adaptationNote?: string };
+                    const next = VALID_STAGES.includes(args.stage as InterviewStage)
+                      ? (args.stage as InterviewStage)
+                      : session.currentStage;
+                    const sStore = loadStore();
+                    const s = sStore.sessions.find((item) => item.id === activeSessionId);
+                    if (s) {
+                      s.currentStage = next;
+                      if (args.adaptationNote) s.adaptationNotes.push(args.adaptationNote);
+                      saveStore(sStore);
+                    }
+                    sendJson({ type: "stage_updated", stage: next });
+                  }
+                  return { id: call.id, name: call.name, response: { ok: true } };
+                });
+                liveSession.sendToolResponse({ functionResponses: responses });
+              }
+            },
+            onerror: (err: unknown) => {
+              sendJson({
+                type: "error",
+                message: err instanceof Error ? err.message : "Live voice error.",
+              });
+            },
+          },
+        });
+        liveSession = conn;
+        liveSession.sendRealtimeInput({
+          text: msg.resume
+            ? `Candidate ${session.candidateName} has resumed the interview. Welcome them back briefly and continue.`
+            : `Candidate ${session.candidateName} joined for ${role.title}. Begin with your greeting and first question.`,
+        });
+      } catch (err) {
+        sendJson({
+          type: "error",
+          message: err instanceof Error ? err.message : "Failed to connect.",
+        });
+      }
+    } else if (msg.type === "audio" && msg.audio && liveSession) {
+      liveSession.sendRealtimeInput({
+        audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
+      });
+    } else if (msg.type === "text" && msg.text && liveSession) {
+      flushPending(false);
+      commitTurn("candidate", msg.text, false);
+      liveSession.sendRealtimeInput({ text: msg.text });
+    } else if (msg.type === "manual_interrupt") {
+      if (pendingInterviewer.trim()) {
+        commitTurn("interviewer", pendingInterviewer, true);
+        pendingInterviewer = "";
+      }
+      sendJson({ type: "interrupted" });
+    } else if (msg.type === "pause") {
+      flushPending(false);
+      if (activeSessionId) {
+        const store = loadStore();
+        const s = store.sessions.find((item) => item.id === activeSessionId);
+        if (s) {
+          s.status = "paused";
+          if (typeof msg.elapsedSeconds === "number") s.elapsedSeconds = msg.elapsedSeconds;
+          saveStore(store);
+        }
+      }
+      closeLive();
+    } else if (msg.type === "finish") {
+      flushPending(false);
+      if (activeSessionId) {
+        const store = loadStore();
+        const s = store.sessions.find((item) => item.id === activeSessionId);
+        if (s && typeof msg.elapsedSeconds === "number") {
+          s.elapsedSeconds = msg.elapsedSeconds;
+          saveStore(store);
+        }
+      }
+      closeLive();
+    }
+  });
+
+  clientWs.on("close", () => {
+    flushPending(false);
+    closeLive();
+  });
+});
+
+const PORT = Number(process.env.PORT || 3001);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Voice Interview Agent running at http://localhost:${PORT}`);
+});
